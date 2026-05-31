@@ -1,0 +1,13 @@
+{
+  "name": "createpicai-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Replicate proxy for CreatePicAI mobile app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
