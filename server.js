@@ -2,6 +2,8 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
+const { OAuth2Client } = require('google-auth-library');
 
 function loadEnvFile() {
   const envPath = path.resolve(__dirname, '..', '.env');
@@ -35,51 +37,89 @@ const PORT = Number(process.env.PORT || 8787);
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 const FLUX_PRO = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-1.1-pro';
 const FLUX_ULTRA = process.env.REPLICATE_MODEL_ULTRA || 'black-forest-labs/flux-1.1-pro-ultra';
+const WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID;
+const DATABASE_URL = process.env.DATABASE_URL;
 
-// Tier → (model, input) mapping. low/medium use flux-1.1-pro with quality knobs;
-// high uses flux-1.1-pro-ultra for the 4MP step up that justifies 10 credits.
-function planForTier(tier, prompt, aspectRatio, imagePrompt) {
-  const ar = aspectRatio || '1:1';
-  const withImage = input => imagePrompt ? { ...input, image_prompt: imagePrompt } : input;
-  if (tier === 'low') {
-    return {
-      model: FLUX_PRO,
-      input: withImage({
-        prompt,
-        aspect_ratio: ar,
-        output_format: 'jpg',
-        output_quality: 75,
-        safety_tolerance: 2,
-        prompt_upsampling: false,
-      }),
-    };
-  }
-  if (tier === 'high') {
-    return {
-      model: FLUX_ULTRA,
-      input: withImage({
-        prompt,
-        aspect_ratio: ar,
-        output_format: 'jpg',
-        safety_tolerance: 2,
-        raw: false,
-        ...(imagePrompt ? { image_prompt_strength: 0.35 } : null),
-      }),
-    };
-  }
-  // medium (default)
+const pool = DATABASE_URL
+  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+const googleClient = WEB_CLIENT_ID ? new OAuth2Client(WEB_CLIENT_ID) : null;
+
+async function verifyGoogleToken(idToken) {
+  if (!googleClient) throw new Error('Server missing GOOGLE_WEB_CLIENT_ID');
+  const ticket = await googleClient.verifyIdToken({ idToken, audience: WEB_CLIENT_ID });
+  const payload = ticket.getPayload();
   return {
-    model: FLUX_PRO,
-    input: withImage({
-      prompt,
-      aspect_ratio: ar,
-      output_format: 'jpg',
-      output_quality: 90,
-      safety_tolerance: 2,
-      // prompt_upsampling can conflict with image_prompt — disable when a reference is provided
-      prompt_upsampling: imagePrompt ? false : true,
-    }),
+    googleUserId: payload.sub,
+    email: payload.email,
+    name: payload.name || null,
+    picture: payload.picture || null,
   };
+}
+
+async function upsertUser(u) {
+  const r = await pool.query(
+    `INSERT INTO users (google_user_id, email, name, picture)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (google_user_id) DO UPDATE
+       SET email = EXCLUDED.email,
+           name = EXCLUDED.name,
+           picture = EXCLUDED.picture,
+           updated_at = now()
+     RETURNING credits`,
+    [u.googleUserId, u.email, u.name, u.picture],
+  );
+  return r.rows[0].credits;
+}
+
+async function getUserCredits(googleUserId) {
+  const r = await pool.query('SELECT credits FROM users WHERE google_user_id = $1', [googleUserId]);
+  return r.rows[0] ? r.rows[0].credits : null;
+}
+
+async function debitCredit(googleUserId) {
+  const r = await pool.query(
+    `UPDATE users SET credits = credits - 1, updated_at = now()
+     WHERE google_user_id = $1 AND credits >= 1
+     RETURNING credits`,
+    [googleUserId],
+  );
+  return r.rows[0] ? r.rows[0].credits : null;
+}
+
+async function refundCredit(googleUserId) {
+  await pool.query(
+    'UPDATE users SET credits = credits + 1, updated_at = now() WHERE google_user_id = $1',
+    [googleUserId],
+  );
+}
+
+async function authFromHeader(req) {
+  const auth = req.headers.authorization || '';
+  if (!auth.startsWith('Bearer ')) return null;
+  try {
+    return await verifyGoogleToken(auth.slice(7));
+  } catch {
+    return null;
+  }
+}
+
+// Single-model plan: every request goes to Flux 1.1 Pro Ultra (4 MP).
+// The `tier` parameter is accepted for backward compatibility but ignored.
+function planForTier(_tier, prompt, aspectRatio, imagePrompt) {
+  const ar = aspectRatio || '1:1';
+  const input = {
+    prompt,
+    aspect_ratio: ar,
+    output_format: 'jpg',
+    safety_tolerance: 2,
+    raw: false,
+  };
+  if (imagePrompt) {
+    input.image_prompt = imagePrompt;
+    input.image_prompt_strength = 0.35;
+  }
+  return { model: FLUX_ULTRA, input };
 }
 
 function readJson(req) {
@@ -253,7 +293,7 @@ async function pollUntilDone(id, deadlineMs) {
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
 
   if (req.method === 'OPTIONS') {
@@ -267,9 +307,45 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       provider: 'replicate',
-      models: { pro: FLUX_PRO, ultra: FLUX_ULTRA },
+      model: FLUX_ULTRA,
       hasToken: Boolean(REPLICATE_API_TOKEN),
+      hasDatabase: Boolean(pool),
+      hasGoogleAuth: Boolean(googleClient),
     }));
+    return;
+  }
+
+  // POST /v1/auth/google — body { idToken } → upsert user, return credits
+  if (req.method === 'POST' && req.url === '/v1/auth/google') {
+    try {
+      if (!pool) throw new Error('Server missing DATABASE_URL');
+      const body = await readJson(req);
+      const idToken = String(body.idToken || '');
+      if (!idToken) throw new Error('Missing idToken');
+      const user = await verifyGoogleToken(idToken);
+      const credits = await upsertUser(user);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ user, credits }));
+    } catch (error) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || String(error) }));
+    }
+    return;
+  }
+
+  // GET /v1/credits — Authorization: Bearer <id_token> → current credit balance
+  if (req.method === 'GET' && req.url === '/v1/credits') {
+    try {
+      const auth = await authFromHeader(req);
+      if (!auth) throw new Error('Unauthorized');
+      const credits = await getUserCredits(auth.googleUserId);
+      if (credits === null) throw new Error('User not found');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ credits }));
+    } catch (error) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || String(error) }));
+    }
     return;
   }
 
@@ -279,24 +355,35 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  let debitedUserId = null;
   try {
-    if (!REPLICATE_API_TOKEN) {
-      throw new Error('Missing REPLICATE_API_TOKEN');
+    if (!REPLICATE_API_TOKEN) throw new Error('Missing REPLICATE_API_TOKEN');
+    if (!pool) throw new Error('Server missing DATABASE_URL');
+
+    const auth = await authFromHeader(req);
+    if (!auth) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
     }
 
     const body = await readJson(req);
     const prompt = String(body.prompt || body.input?.prompt || '').trim();
-    if (!prompt) {
-      throw new Error('Missing prompt');
-    }
+    if (!prompt) throw new Error('Missing prompt');
 
-    const tier = body.model === 'low' || body.model === 'medium' || body.model === 'high'
-      ? body.model
-      : (body.tier || 'medium');
     const aspectRatio = body.aspect_ratio || body.input?.aspect_ratio;
     const imagePrompt = typeof body.image_prompt === 'string' && body.image_prompt.length > 0
       ? body.image_prompt
       : undefined;
+
+    // Atomic debit (succeeds only if credits >= 1)
+    const remaining = await debitCredit(auth.googleUserId);
+    if (remaining === null) {
+      res.writeHead(402, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'insufficient_credits' }));
+      return;
+    }
+    debitedUserId = auth.googleUserId;
 
     // Flux is English-only; translate/clean non-English prompts before sending.
     const fluxPrompt = await rewritePromptForFlux(prompt);
@@ -304,13 +391,12 @@ const server = http.createServer(async (req, res) => {
       console.log(`[translate] "${prompt}" -> "${fluxPrompt}"`);
     }
 
-    const { model, input } = planForTier(tier, fluxPrompt, aspectRatio, imagePrompt);
+    const { model, input } = planForTier(null, fluxPrompt, aspectRatio, imagePrompt);
     const [owner, name] = model.split('/');
 
     let prediction = await replicateRequest('POST', `/v1/models/${owner}/${name}/predictions`, { input });
 
     if (prediction.status !== 'succeeded' && prediction.status !== 'failed' && prediction.id) {
-      // Replicate's Prefer:wait=60 caps at 60s; ultra tier can run longer.
       prediction = await pollUntilDone(prediction.id, Date.now() + 90_000);
     }
 
@@ -319,29 +405,31 @@ const server = http.createServer(async (req, res) => {
     }
 
     const url = firstImage(prediction.output);
-    if (!url) {
-      throw new Error('No image URL returned');
-    }
+    if (!url) throw new Error('No image URL returned');
 
+    debitedUserId = null; // commit: do not refund on success
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       url,
       imageUrl: url,
       model,
-      tier,
       id: prediction.id,
       status: prediction.status,
+      credits: remaining,
     }));
   } catch (error) {
+    if (debitedUserId) {
+      try { await refundCredit(debitedUserId); } catch {}
+    }
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: error.message || String(error) }));
   }
 });
 
 server.listen(PORT, () => {
-  console.log(`CreatePicAI Replicate proxy on http://localhost:${PORT}`);
-  console.log(`Endpoint: POST /v1/generate { prompt, model: 'low'|'medium'|'high' }`);
-  console.log(`Pro:   ${FLUX_PRO}`);
-  console.log(`Ultra: ${FLUX_ULTRA}`);
-  console.log(`REPLICATE_API_TOKEN loaded: ${Boolean(REPLICATE_API_TOKEN)}`);
+  console.log(`CreatePicAI backend on :${PORT}`);
+  console.log(`  Model:    ${FLUX_ULTRA}`);
+  console.log(`  Replicate token: ${Boolean(REPLICATE_API_TOKEN)}`);
+  console.log(`  Database:        ${Boolean(pool)}`);
+  console.log(`  Google auth:     ${Boolean(googleClient)}`);
 });
