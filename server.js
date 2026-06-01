@@ -294,7 +294,7 @@ async function pollUntilDone(id, deadlineMs) {
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, PUT, DELETE, OPTIONS, GET');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -326,6 +326,73 @@ const server = http.createServer(async (req, res) => {
       const credits = await upsertUser(user);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ user, credits }));
+    } catch (error) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || String(error) }));
+    }
+    return;
+  }
+
+  // PUT /v1/profile — Authorization: Bearer <id_token>, body { name } → update display name
+  if (req.method === 'PUT' && req.url === '/v1/profile') {
+    try {
+      const auth = await authFromHeader(req);
+      if (!auth) throw new Error('Unauthorized');
+      const body = await readJson(req);
+      const name = typeof body.name === 'string' ? body.name.trim().slice(0, 60) : '';
+      if (!name) throw new Error('Missing name');
+      await pool.query(
+        'UPDATE users SET name = $1, updated_at = now() WHERE google_user_id = $2',
+        [name, auth.googleUserId],
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ name }));
+    } catch (error) {
+      const code = error.message === 'Unauthorized' ? 401 : 400;
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || String(error) }));
+    }
+    return;
+  }
+
+  // GET /v1/creations — Authorization: Bearer <id_token> → user's creation history
+  if (req.method === 'GET' && req.url === '/v1/creations') {
+    try {
+      const auth = await authFromHeader(req);
+      if (!auth) throw new Error('Unauthorized');
+      const r = await pool.query(
+        `SELECT c.id::text AS id, c.prompt, c.image_url AS uri, c.model,
+                CAST(EXTRACT(EPOCH FROM c.created_at) * 1000 AS BIGINT) AS "createdAt"
+         FROM creations c
+         JOIN users u ON u.id = c.user_id
+         WHERE u.google_user_id = $1
+         ORDER BY c.created_at DESC
+         LIMIT 200`,
+        [auth.googleUserId],
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ creations: r.rows }));
+    } catch (error) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: error.message || String(error) }));
+    }
+    return;
+  }
+
+  // DELETE /v1/creations/:id — Authorization: Bearer <id_token>
+  if (req.method === 'DELETE' && req.url && req.url.startsWith('/v1/creations/')) {
+    try {
+      const auth = await authFromHeader(req);
+      if (!auth) throw new Error('Unauthorized');
+      const id = req.url.slice('/v1/creations/'.length);
+      if (!id) throw new Error('Missing id');
+      await pool.query(
+        `DELETE FROM creations c USING users u
+         WHERE c.user_id = u.id AND u.google_user_id = $1 AND c.id::text = $2`,
+        [auth.googleUserId, id],
+      );
+      res.writeHead(204);
+      res.end();
     } catch (error) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message || String(error) }));
@@ -408,6 +475,22 @@ const server = http.createServer(async (req, res) => {
     if (!url) throw new Error('No image URL returned');
 
     debitedUserId = null; // commit: do not refund on success
+
+    // Persist creation to the user's history (best-effort — failure here doesn't
+    // block the response since the image was generated successfully).
+    let creationId = null;
+    try {
+      const ins = await pool.query(
+        `INSERT INTO creations (user_id, prompt, image_url, model)
+         SELECT id, $1, $2, $3 FROM users WHERE google_user_id = $4
+         RETURNING id::text`,
+        [prompt, url, model, auth.googleUserId],
+      );
+      creationId = ins.rows[0]?.id || null;
+    } catch (e) {
+      console.error('[creations] save failed', e.message);
+    }
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       url,
@@ -416,6 +499,7 @@ const server = http.createServer(async (req, res) => {
       id: prediction.id,
       status: prediction.status,
       credits: remaining,
+      creationId,
     }));
   } catch (error) {
     if (debitedUserId) {
